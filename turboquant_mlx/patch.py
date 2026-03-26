@@ -104,15 +104,27 @@ class TurboQuantKVCache:
             old_k = self._fp_keys[:, :, :n_to_compress, :]
             old_v = self._fp_values[:, :, :n_to_compress, :]
 
-            # Compress per head
+            # Compress per head, merging with any previously compressed tokens
             for h in range(n_kv_heads):
+                # Decompress previously compressed tokens (if any)
+                prev_k_flat = None
+                prev_v_flat = None
+                if self._k_states[h]:
+                    prev_k_flat = self._k_compressors[h].dequantize(self._k_states[h][0])
+                    prev_v_flat = self._v_compressors[h].dequantize(self._v_states[h][0])
+
                 # (B, n_to_compress, head_dim)
-                k_head = old_k[:, h, :, :]  # (B, n_to_compress, head_dim)
+                k_head = old_k[:, h, :, :]
                 v_head = old_v[:, h, :, :]
 
                 # Flatten batch and sequence for compression
                 k_flat = k_head.reshape(-1, head_dim)
                 v_flat = v_head.reshape(-1, head_dim)
+
+                # Merge with previously compressed tokens
+                if prev_k_flat is not None:
+                    k_flat = mx.concatenate([prev_k_flat, k_flat], axis=0)
+                    v_flat = mx.concatenate([prev_v_flat, v_flat], axis=0)
 
                 self._k_states[h] = [self._k_compressors[h].quantize(k_flat)]
                 self._v_states[h] = [self._v_compressors[h].quantize(v_flat)]
@@ -223,9 +235,26 @@ class TurboQuantKVCache:
 
 def _get_model_config(model: nn.Module) -> tuple[int, int, int]:
     """Extract head_dim, n_kv_heads, n_layers from an MLX-LM model."""
-    # Try common attribute patterns
-    if hasattr(model, "args"):
+    # For multimodal models (e.g. Qwen3.5), look in language_model.args or
+    # text_config first, since the top-level args may lack text model details.
+    args = None
+    for candidate in [
+        getattr(getattr(model, "language_model", None), "args", None),
+        getattr(model, "args", None),
+    ]:
+        if candidate is not None and hasattr(candidate, "num_hidden_layers"):
+            args = candidate
+            break
+    if args is None and hasattr(model, "args"):
         args = model.args
+
+    # Also check for nested text_config
+    if args is not None and hasattr(args, "text_config"):
+        text_cfg = args.text_config
+        if hasattr(text_cfg, "head_dim") or hasattr(text_cfg, "num_hidden_layers"):
+            args = text_cfg
+
+    if args is not None:
         head_dim = getattr(args, "head_dim", None)
         if head_dim is None:
             hidden = getattr(args, "hidden_size", getattr(args, "dim", 4096))
@@ -307,18 +336,45 @@ def patch_model(
     inner_model = model.model if hasattr(model, "model") else model
     original_make_cache = getattr(inner_model, "make_cache", None)
 
+    # Detect SSM (non-attention) layer indices that need standard caches.
+    # Models like Qwen3.5 have hybrid attention+SSM architectures.
+    _inner_for_ssm = getattr(model, "language_model", inner_model)
+    _inner_for_ssm = getattr(_inner_for_ssm, "model", _inner_for_ssm)
+    ssm_indices = set()
+    if hasattr(_inner_for_ssm, "ssm_idx"):
+        idx = _inner_for_ssm.ssm_idx
+        if isinstance(idx, (list, tuple)):
+            ssm_indices = set(idx)
+        elif isinstance(idx, int):
+            ssm_indices = {idx}
+    if ssm_indices:
+        logger.info(f"SSM layer indices (will use standard cache): {sorted(ssm_indices)}")
+
     def turboquant_make_cache():
+        # If the model has its own make_cache, use it as the base and only
+        # replace attention (KV) caches with TurboQuantKVCache.
+        if original_make_cache is not None:
+            base_caches = original_make_cache()
+            from mlx_lm.models.cache import KVCache
+
+            caches = []
+            for i, c in enumerate(base_caches):
+                if isinstance(c, KVCache):
+                    caches.append(TurboQuantKVCache(head_dim, n_kv_heads, config, layer_idx=i))
+                else:
+                    caches.append(c)  # Keep SSM/ArraysCache etc. as-is
+            return caches
+
         return [
             TurboQuantKVCache(head_dim, n_kv_heads, config, layer_idx=i)
             for i in range(n_layers)
         ]
 
-    # Patch make_cache on the inner model (where MLX-LM looks for it)
-    # The top-level model wrapper delegates to model.model if it has make_cache
+    # Patch make_cache on both the top-level model and inner model.
+    # make_prompt_cache checks hasattr(model, "make_cache") on the top-level object.
+    setattr(model, "make_cache", turboquant_make_cache)
     if hasattr(model, "model"):
         setattr(model.model, "make_cache", turboquant_make_cache)
-    else:
-        setattr(model, "make_cache", turboquant_make_cache)
 
     # Store original for unpatch
     setattr(model, _PATCHED_ATTR, original_make_cache)
@@ -345,8 +401,13 @@ def unpatch_model(model: nn.Module) -> nn.Module:
 
     if original is not None:
         inner_model.make_cache = original
-    elif hasattr(inner_model, "make_cache"):
-        delattr(inner_model, "make_cache")
+        if hasattr(model, "make_cache") and model is not inner_model:
+            model.make_cache = original
+    else:
+        if hasattr(inner_model, "make_cache"):
+            delattr(inner_model, "make_cache")
+        if model is not inner_model and hasattr(model, "make_cache"):
+            delattr(model, "make_cache")
 
     delattr(model, _PATCHED_ATTR)
     if hasattr(model, "_turboquant_config"):
