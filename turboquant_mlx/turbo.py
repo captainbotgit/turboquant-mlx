@@ -21,7 +21,9 @@ import numpy as np
 from .codebook import (
     dequantize_scalar,
     get_gaussian_codebook,
+    pack_indices,
     quantize_scalar,
+    unpack_indices,
 )
 from .qjl import QJLProjection, QJLState
 
@@ -47,8 +49,10 @@ class TurboQuantConfig:
 class TurboQuantState:
     """Compressed representation of a KV cache vector batch."""
 
-    # MSE quantization indices: (batch, dim), dtype int8/int16
-    mse_indices: mx.array
+    # MSE quantization indices: bit-packed uint8, (batch, packed_dim)
+    mse_indices_packed: mx.array
+    # Original dimension before packing (needed for unpack)
+    mse_orig_dim: int
     # Vector norms for rescaling: (batch,)
     norms: mx.array
     # QJL state for residual (None if mode="mse")
@@ -127,8 +131,12 @@ class TurboQuantCompressor:
             residual = x - x_hat
             qjl_state = self._qjl.quantize(residual)
 
+        # Bit-pack indices for memory efficiency
+        packed_indices, orig_dim = pack_indices(mse_indices, self.config.mse_bits)
+
         return TurboQuantState(
-            mse_indices=mse_indices,
+            mse_indices_packed=packed_indices,
+            mse_orig_dim=orig_dim,
             norms=norms,
             qjl_state=qjl_state,
             config=self.config,
@@ -142,8 +150,13 @@ class TurboQuantCompressor:
         """
         scale = mx.array(np.sqrt(self.head_dim), dtype=mx.float32)
 
+        # Unpack bit-packed indices
+        mse_indices = unpack_indices(
+            state.mse_indices_packed, state.config.mse_bits, state.mse_orig_dim
+        )
+
         # MSE reconstruction
-        y_hat_scaled = dequantize_scalar(state.mse_indices, self._mse_codebook)
+        y_hat_scaled = dequantize_scalar(mse_indices, self._mse_codebook)
         y_hat = y_hat_scaled / scale
         x_hat_normalized = y_hat @ self.rotation_matrix
         x_hat = x_hat_normalized * mx.expand_dims(state.norms, -1)

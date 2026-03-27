@@ -17,13 +17,17 @@ from dataclasses import dataclass
 import mlx.core as mx
 import numpy as np
 
+from .codebook import pack_signs, unpack_signs
+
 
 @dataclass
 class QJLState:
     """Compressed QJL representation of residual vectors."""
 
-    # Sign bits of projected residual: (batch, proj_dim), stored as int8 {-1, +1}
-    sign_bits: mx.array
+    # Sign bits of projected residual: bit-packed uint8, (batch, packed_dim)
+    sign_bits_packed: mx.array
+    # Original projection dimension before packing
+    sign_orig_dim: int
     # Residual norms: (batch,)
     norms: mx.array
 
@@ -53,8 +57,9 @@ class QJLProjection:
         # Generate random Gaussian projection matrix
         # Using numpy for deterministic init, then convert to MLX
         rng = np.random.RandomState(seed)
-        # S ~ N(0, 1/dim) to keep scales reasonable
-        s_np = rng.randn(self.proj_dim, dim).astype(np.float32) / np.sqrt(dim)
+        # S ~ N(0, 1) — raw Gaussian entries, no normalization
+        # The scale factor in dequantize() accounts for the projection dimension
+        s_np = rng.randn(self.proj_dim, dim).astype(np.float32)
         self.projection_matrix = mx.array(s_np)  # (proj_dim, dim)
 
         # Precompute scaling factor: sqrt(pi/2) / proj_dim
@@ -80,7 +85,10 @@ class QJLProjection:
         # Replace zeros with +1 (arbitrary but consistent)
         sign_bits = mx.where(sign_bits == 0, mx.array(1, dtype=mx.int8), sign_bits)
 
-        return QJLState(sign_bits=sign_bits, norms=norms)
+        # Bit-pack signs: 8 per byte
+        packed, orig_dim = pack_signs(sign_bits)
+
+        return QJLState(sign_bits_packed=packed, sign_orig_dim=orig_dim, norms=norms)
 
     def dequantize(self, state: QJLState) -> mx.array:
         """Reconstruct approximate residuals from QJL state.
@@ -94,9 +102,12 @@ class QJLProjection:
         Returns:
             (batch, dim) approximate residual vectors.
         """
+        # Unpack sign bits
+        sign_bits = unpack_signs(state.sign_bits_packed, state.sign_orig_dim)
+
         # r_hat = scale * ||r|| * S^T @ signs
         # (batch, proj_dim) @ (proj_dim, dim) → (batch, dim)
-        signs_float = state.sign_bits.astype(mx.float32)
+        signs_float = sign_bits.astype(mx.float32)
         reconstructed = signs_float @ self.projection_matrix  # (batch, dim)
 
         # Scale by norms and constant

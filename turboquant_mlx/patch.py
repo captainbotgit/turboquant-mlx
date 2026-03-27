@@ -20,12 +20,40 @@ from typing import Any, Literal
 import mlx.core as mx
 import mlx.nn as nn
 
-from .turbo import TurboQuantCompressor, TurboQuantConfig
+from .qjl import QJLState
+from .turbo import TurboQuantCompressor, TurboQuantConfig, TurboQuantState
 
 logger = logging.getLogger(__name__)
 
 # Sentinel to track patched models
 _PATCHED_ATTR = "_turboquant_original_make_cache"
+
+
+def _concat_states(a: TurboQuantState, b: TurboQuantState) -> TurboQuantState:
+    """Concatenate two TurboQuantStates along the batch (token) dimension.
+
+    This enables incremental compression: quantize new tokens independently
+    and append to the existing compressed state without re-quantizing.
+    """
+    qjl_state = None
+    if a.qjl_state is not None and b.qjl_state is not None:
+        qjl_state = QJLState(
+            sign_bits_packed=mx.concatenate(
+                [a.qjl_state.sign_bits_packed, b.qjl_state.sign_bits_packed], axis=0
+            ),
+            sign_orig_dim=a.qjl_state.sign_orig_dim,
+            norms=mx.concatenate([a.qjl_state.norms, b.qjl_state.norms], axis=0),
+        )
+
+    return TurboQuantState(
+        mse_indices_packed=mx.concatenate(
+            [a.mse_indices_packed, b.mse_indices_packed], axis=0
+        ),
+        mse_orig_dim=a.mse_orig_dim,
+        norms=mx.concatenate([a.norms, b.norms], axis=0),
+        qjl_state=qjl_state,
+        config=a.config,
+    )
 
 
 class TurboQuantKVCache:
@@ -49,13 +77,19 @@ class TurboQuantKVCache:
         self.config = config
         self.offset = 0
 
-        # One compressor per KV head (keys and values share config but separate state)
+        # Per the paper and reference implementations:
+        # - Values use MSE-only at full bit budget (they need element-wise
+        #   reconstruction for weighted sum in attention)
+        # - Keys use MSE-only for now (asymmetric QJL scoring, which avoids
+        #   element-wise reconstruction, requires modifying the attention layer)
+        # Both use mode="mse" to avoid QJL element-wise reconstruction noise.
+        mse_config = TurboQuantConfig(bits=config.bits, mode="mse")
         self._k_compressors = [
-            TurboQuantCompressor(head_dim, config, seed=layer_idx * 1000 + h)
+            TurboQuantCompressor(head_dim, mse_config, seed=layer_idx * 1000 + h)
             for h in range(n_kv_heads)
         ]
         self._v_compressors = [
-            TurboQuantCompressor(head_dim, config, seed=layer_idx * 1000 + n_kv_heads + h)
+            TurboQuantCompressor(head_dim, mse_config, seed=layer_idx * 1000 + n_kv_heads + h)
             for h in range(n_kv_heads)
         ]
 
@@ -104,15 +138,8 @@ class TurboQuantKVCache:
             old_k = self._fp_keys[:, :, :n_to_compress, :]
             old_v = self._fp_values[:, :, :n_to_compress, :]
 
-            # Compress per head, merging with any previously compressed tokens
+            # Compress per head — append new compressed to existing (no re-compression)
             for h in range(n_kv_heads):
-                # Decompress previously compressed tokens (if any)
-                prev_k_flat = None
-                prev_v_flat = None
-                if self._k_states[h]:
-                    prev_k_flat = self._k_compressors[h].dequantize(self._k_states[h][0])
-                    prev_v_flat = self._v_compressors[h].dequantize(self._v_states[h][0])
-
                 # (B, n_to_compress, head_dim)
                 k_head = old_k[:, h, :, :]
                 v_head = old_v[:, h, :, :]
@@ -121,13 +148,19 @@ class TurboQuantKVCache:
                 k_flat = k_head.reshape(-1, head_dim)
                 v_flat = v_head.reshape(-1, head_dim)
 
-                # Merge with previously compressed tokens
-                if prev_k_flat is not None:
-                    k_flat = mx.concatenate([prev_k_flat, k_flat], axis=0)
-                    v_flat = mx.concatenate([prev_v_flat, v_flat], axis=0)
+                # Quantize only the new tokens
+                new_k_state = self._k_compressors[h].quantize(k_flat)
+                new_v_state = self._v_compressors[h].quantize(v_flat)
 
-                self._k_states[h] = [self._k_compressors[h].quantize(k_flat)]
-                self._v_states[h] = [self._v_compressors[h].quantize(v_flat)]
+                # Append to existing compressed state (no decompress-recompress)
+                if self._k_states[h]:
+                    old_ks = self._k_states[h][0]
+                    old_vs = self._v_states[h][0]
+                    self._k_states[h] = [_concat_states(old_ks, new_k_state)]
+                    self._v_states[h] = [_concat_states(old_vs, new_v_state)]
+                else:
+                    self._k_states[h] = [new_k_state]
+                    self._v_states[h] = [new_v_state]
 
             # Keep only recent window in fp16
             self._fp_keys = self._fp_keys[:, :, n_to_compress:, :]
@@ -223,13 +256,13 @@ class TurboQuantKVCache:
         # Report fp16-equivalent for now
         for h in range(self.n_kv_heads):
             for state in self._k_states[h]:
-                total += state.mse_indices.nbytes + state.norms.nbytes
+                total += state.mse_indices_packed.nbytes + state.norms.nbytes
                 if state.qjl_state is not None:
-                    total += state.qjl_state.sign_bits.nbytes + state.qjl_state.norms.nbytes
+                    total += state.qjl_state.sign_bits_packed.nbytes + state.qjl_state.norms.nbytes
             for state in self._v_states[h]:
-                total += state.mse_indices.nbytes + state.norms.nbytes
+                total += state.mse_indices_packed.nbytes + state.norms.nbytes
                 if state.qjl_state is not None:
-                    total += state.qjl_state.sign_bits.nbytes + state.qjl_state.norms.nbytes
+                    total += state.qjl_state.sign_bits_packed.nbytes + state.qjl_state.norms.nbytes
         return total
 
 

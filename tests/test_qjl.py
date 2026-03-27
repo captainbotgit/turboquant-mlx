@@ -14,16 +14,20 @@ class TestQJLProjection:
         x = mx.random.normal(shape=(10, 64))
         state = qjl.quantize(x)
 
-        assert state.sign_bits.shape == (10, 64)
+        # Signs are bit-packed: 64 signs → 8 bytes
+        assert state.sign_bits_packed.shape == (10, 8)
+        assert state.sign_orig_dim == 64
         assert state.norms.shape == (10,)
 
     def test_sign_bits_are_binary(self):
-        """Sign bits should be {-1, +1} only."""
+        """Sign bits should be {-1, +1} after unpacking."""
+        from turboquant_mlx.codebook import unpack_signs
+
         qjl = QJLProjection(dim=32, seed=0)
         x = mx.random.normal(shape=(5, 32))
         state = qjl.quantize(x)
 
-        signs = np.array(state.sign_bits)
+        signs = np.array(unpack_signs(state.sign_bits_packed, state.sign_orig_dim))
         unique = set(signs.flatten())
         assert unique <= {-1, 1}
 
